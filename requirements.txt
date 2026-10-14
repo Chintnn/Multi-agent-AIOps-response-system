@@ -1,2 +1,5 @@
 pydantic>=2.7,<3.0
 pytest>=8.0,<9.0
+langgraph
+langchain-groq
+python-dotenv
