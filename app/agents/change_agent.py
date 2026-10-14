@@ -4,28 +4,43 @@ Change Analysis Agent
 Owner: Member 3
 
 Responsibility:
-- Takes deployment/config change history and the incident timestamp.
-- Checks whether any change occurred near the incident window.
-- Returns evidence for or against a change-related root cause.
+- Inspects an incident's recent_changes for signals of a change-related cause.
 - Does NOT assume the latest deployment caused the incident by default;
-  must check timing and correlate with other evidence.
+  flags it as a hypothesis to correlate with logs/metrics, not a conclusion.
 """
 
-from app.models import AgentFinding  # TODO: confirm this model exists / adjust import
+from app.models import EvidenceFinding, IncidentInput
 
 
-def analyze_change(incident_id: str, deployment_history: list) -> AgentFinding:
+def analyze_change(incident: IncidentInput) -> EvidenceFinding:
     """
-    Analyze deployment/change history against the incident.
-
-    Args:
-        incident_id: ID of the incident being investigated.
-        deployment_history: List of recent deployments/config changes.
-
-    Returns:
-        AgentFinding: structured evidence, hypotheses, and recommended next step.
+    Inspect recent_changes for deployment/config changes that could plausibly
+    relate to the incident. Simple keyword-based baseline, consistent with
+    inspect_logs / inspect_metrics in incident_tools.py.
     """
-    # TODO: implement timing comparison logic
-    # TODO: call LLM (Groq/Llama) with incident + deployment context
-    # TODO: validate output against shared schema
-    raise NotImplementedError("Change Analysis Agent not yet implemented")
+    change_keywords = ("deploy", "config", "rollout", "release", "migration")
+
+    matches = [
+        change
+        for change in incident.recent_changes
+        if any(term in change.lower() for term in change_keywords)
+    ]
+
+    if matches:
+        observation = (
+            f"Found {len(matches)} recent change(s) that may be related to the incident."
+        )
+        next_step = (
+            "Correlate the timing and nature of these changes with log and metric "
+            "evidence before concluding they caused the incident."
+        )
+    else:
+        observation = "No recent changes were found that obviously relate to this incident."
+        next_step = "Treat change history as unlikely cause; focus on logs and metrics."
+
+    return EvidenceFinding(
+        source="change_agent",
+        observation=observation,
+        evidence=matches,
+        suggested_next_step=next_step,
+    )

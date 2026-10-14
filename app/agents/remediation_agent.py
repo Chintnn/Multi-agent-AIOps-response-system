@@ -10,25 +10,19 @@ Responsibility:
 - Checks simulated post-action metrics to verify recovery.
 """
 
-from app.models import AgentFinding  # TODO: confirm this model exists / adjust import
+from app.models import EvidenceFinding, IncidentInput
 
 
-def propose_remediation(findings: list) -> dict:
+def propose_remediation(findings: list[EvidenceFinding]) -> dict:
     """
     Propose a safe remediation action based on combined agent findings.
-
-    Args:
-        findings: List of AgentFinding objects from other agents.
-
-    Returns:
-        dict: proposed action, risk level, and whether approval is required.
     """
     # TODO: implement option evaluation logic
     # TODO: enforce approval gate for risky actions
     raise NotImplementedError("Remediation Agent not yet implemented")
 
 
-def verify_recovery(incident_id: str, post_action_metrics: dict) -> bool:
+def verify_recovery(incident: IncidentInput, post_action_metrics: dict) -> bool:
     """
     Check simulated post-action metrics to determine if recovery occurred.
     """
