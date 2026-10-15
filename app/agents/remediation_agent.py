@@ -24,6 +24,15 @@ ACTION_RISK_LEVELS = {
 # Risk levels that require explicit human approval before execution.
 RISK_LEVELS_REQUIRING_APPROVAL = {"medium", "high"}
 
+# Same thresholds used by inspect_metrics in incident_tools.py, reused here
+# so "recovered" means "back under the same bar that flagged the incident."
+RECOVERY_THRESHOLDS = {
+    "p95_latency_ms": 1000.0,
+    "http_5xx_rate_percent": 5.0,
+    "cpu_percent": 90.0,
+    "db_connection_pool_percent": 85.0,
+}
+
 
 def _choose_action(findings: list[EvidenceFinding]) -> str:
     """
@@ -86,16 +95,50 @@ def execute_remediation(proposal: dict, approved: bool = False) -> dict:
                       f"(risk level: {proposal['risk_level']}) but was not approved.",
         }
 
-    # TODO (commit 4): hook this up to actually "apply" the simulated action
     return {
         "executed": True,
         "reason": f"Action '{proposal['action']}' executed (simulated).",
     }
 
 
-def verify_recovery(incident: IncidentInput, post_action_metrics: dict) -> bool:
+def verify_recovery(incident: IncidentInput, post_action_metrics: dict) -> dict:
     """
     Check simulated post-action metrics to determine if recovery occurred.
+
+    Compares post_action_metrics against the same thresholds used to flag
+    the original incident (see inspect_metrics in incident_tools.py).
+
+    Args:
+        incident: the original IncidentInput being resolved.
+        post_action_metrics: simulated metrics captured after remediation.
+
+    Returns:
+        dict with keys:
+            recovered (bool): True if no metric is still crossing its threshold.
+            still_elevated (list[str]): descriptions of metrics still crossing thresholds.
+            next_step (str): what to do next.
     """
-    # TODO: implement in commit 4
-    raise NotImplementedError("Recovery verification not yet implemented")
+    still_elevated = []
+
+    for metric, threshold in RECOVERY_THRESHOLDS.items():
+        value = post_action_metrics.get(metric)
+        if value is not None and value >= threshold:
+            still_elevated.append(
+                f"{metric} is still elevated: {value:g} (threshold {threshold:g})"
+            )
+
+    recovered = len(still_elevated) == 0
+
+    if recovered:
+        next_step = "Incident appears resolved. Close out and document the remediation."
+    else:
+        next_step = (
+            "Recovery incomplete. Escalate to a human operator or attempt an "
+            "alternative remediation action."
+        )
+
+    return {
+        "recovered": recovered,
+        "still_elevated": still_elevated,
+        "next_step": next_step,
+    }

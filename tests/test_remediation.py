@@ -1,13 +1,13 @@
 """
 Tests for Change Analysis Agent and Remediation & Verification Agent.
-
-Currently placeholders — real tests added as agents are implemented.
 """
 
-import pytest
-
 from app.agents.change_agent import analyze_change
-from app.agents.remediation_agent import propose_remediation, execute_remediation
+from app.agents.remediation_agent import (
+    propose_remediation,
+    execute_remediation,
+    verify_recovery,
+)
 from app.models import IncidentInput, EvidenceFinding
 
 
@@ -104,8 +104,38 @@ def test_low_risk_action_does_not_need_approval():
     assert result["executed"] is True
 
 
-# --- Verification tests (commit 4) ---
+# --- Verification tests ---
 
-@pytest.mark.skip(reason="Verification logic not yet implemented")
+def test_verify_recovery_detects_successful_recovery():
+    incident = _base_incident()
+    post_metrics = {
+        "p95_latency_ms": 300.0,
+        "http_5xx_rate_percent": 0.5,
+        "cpu_percent": 40.0,
+        "db_connection_pool_percent": 50.0,
+    }
+    result = verify_recovery(incident, post_metrics)
+    assert result["recovered"] is True
+    assert result["still_elevated"] == []
+    assert "resolved" in result["next_step"].lower()
+
+
 def test_verify_recovery_detects_failed_recovery():
-    pass
+    incident = _base_incident()
+    post_metrics = {
+        "p95_latency_ms": 2200.0,
+        "http_5xx_rate_percent": 11.0,
+        "cpu_percent": 55.0,
+        "db_connection_pool_percent": 92.0,
+    }
+    result = verify_recovery(incident, post_metrics)
+    assert result["recovered"] is False
+    assert len(result["still_elevated"]) == 2  # latency + db pool
+    assert "escalate" in result["next_step"].lower()
+
+
+def test_verify_recovery_handles_missing_metrics():
+    incident = _base_incident()
+    result = verify_recovery(incident, {})
+    assert result["recovered"] is True
+    assert result["still_elevated"] == []
