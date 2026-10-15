@@ -7,7 +7,8 @@ Currently placeholders — real tests added as agents are implemented.
 import pytest
 
 from app.agents.change_agent import analyze_change
-from app.models import IncidentInput
+from app.agents.remediation_agent import propose_remediation, execute_remediation
+from app.models import IncidentInput, EvidenceFinding
 
 
 def _base_incident(**overrides) -> IncidentInput:
@@ -24,6 +25,17 @@ def _base_incident(**overrides) -> IncidentInput:
     defaults.update(overrides)
     return IncidentInput(**defaults)
 
+
+def _finding(observation: str, evidence: list[str] | None = None) -> EvidenceFinding:
+    return EvidenceFinding(
+        source="test_source",
+        observation=observation,
+        evidence=evidence or [],
+        suggested_next_step="n/a",
+    )
+
+
+# --- Change Analysis Agent tests ---
 
 def test_detects_relevant_change():
     incident = _base_incident(
@@ -52,10 +64,47 @@ def test_empty_recent_changes():
     assert result.source == "change_agent"
 
 
-@pytest.mark.skip(reason="Remediation Agent not yet implemented")
-def test_remediation_requires_approval_for_risky_action():
-    pass
+# --- Remediation Agent tests ---
 
+def test_proposes_rollback_for_deployment_related_evidence():
+    findings = [_finding("Deployment occurred near incident time", ["deployed v2.4.1"])]
+    proposal = propose_remediation(findings)
+    assert proposal["action"] == "rollback_deployment"
+    assert proposal["risk_level"] == "high"
+    assert proposal["requires_approval"] is True
+
+
+def test_proposes_low_risk_action_for_unrelated_evidence():
+    findings = [_finding("Nothing unusual found")]
+    proposal = propose_remediation(findings)
+    assert proposal["action"] == "clear_cache"
+    assert proposal["risk_level"] == "low"
+    assert proposal["requires_approval"] is False
+
+
+def test_high_risk_action_blocked_without_approval():
+    findings = [_finding("Deployment occurred near incident time", ["deployed v2.4.1"])]
+    proposal = propose_remediation(findings)
+    result = execute_remediation(proposal, approved=False)
+    assert result["executed"] is False
+    assert "requires human approval" in result["reason"]
+
+
+def test_high_risk_action_allowed_with_approval():
+    findings = [_finding("Deployment occurred near incident time", ["deployed v2.4.1"])]
+    proposal = propose_remediation(findings)
+    result = execute_remediation(proposal, approved=True)
+    assert result["executed"] is True
+
+
+def test_low_risk_action_does_not_need_approval():
+    findings = [_finding("Nothing unusual found")]
+    proposal = propose_remediation(findings)
+    result = execute_remediation(proposal, approved=False)
+    assert result["executed"] is True
+
+
+# --- Verification tests (commit 4) ---
 
 @pytest.mark.skip(reason="Verification logic not yet implemented")
 def test_verify_recovery_detects_failed_recovery():
