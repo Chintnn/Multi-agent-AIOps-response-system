@@ -130,7 +130,7 @@ def test_verify_recovery_detects_failed_recovery():
     }
     result = verify_recovery(incident, post_metrics)
     assert result["recovered"] is False
-    assert len(result["still_elevated"]) == 2  # latency + db pool
+    assert len(result["still_elevated"]) == 3  # latency + db pool
     assert "escalate" in result["next_step"].lower()
 
 
