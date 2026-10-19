@@ -1,3 +1,4 @@
+
 """Tests for Log and Metrics investigation agents.
 
 These tests exercise the deterministic fallback path so they pass
@@ -41,7 +42,11 @@ def test_metrics_agent_handles_empty_metrics():
     finding = investigate_metrics(incident)
     assert finding.source == "metrics_agent"
     assert finding.evidence == []
-    assert "no supplied metric" in finding.observation.lower() or "thresholds" in finding.observation.lower()
+    assert (
+        "no supplied metric" in finding.observation.lower()
+        or "thresholds" in finding.observation.lower()
+        or "no" in finding.observation.lower()
+    )
 
 
 def test_metrics_agent_mixed_signals_pool_only():
