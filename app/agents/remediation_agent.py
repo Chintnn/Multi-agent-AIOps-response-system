@@ -1,144 +1,81 @@
-"""
-Remediation & Verification Agent
+"""LLM recommendations with deterministic policy, approval, and verification."""
+from app.incident_tools import METRIC_THRESHOLDS
+from app.agents.context import compact_findings
+from app.llm import invoke_structured
+from app.models import (AgentFinding, ApprovalRecord, IncidentInput,
+                        RemediationInput, RemediationProposal,
+                        RemediationReasoning, RecoveryResult)
 
-Owner: Member 3
-
-Responsibility:
-- Evaluates safe remediation options based on findings from other agents.
-- States risks and expected effects of each option.
-- Requires human approval before executing risky actions.
-- Checks simulated post-action metrics to verify recovery.
-"""
-
-from app.models import EvidenceFinding, IncidentInput
-
-# Risk classification for known remediation actions.
-# Anything not in this map defaults to "high" risk (safe default).
 ACTION_RISK_LEVELS = {
-    "restart_service": "medium",
-    "scale_up_db_pool": "medium",
-    "clear_cache": "low",
-    "rollback_deployment": "high",
+    "restart_service": "medium", "scale_up_db_pool": "medium",
+    "clear_cache": "low", "rollback_deployment": "high",
 }
-
-# Risk levels that require explicit human approval before execution.
 RISK_LEVELS_REQUIRING_APPROVAL = {"medium", "high"}
-
-# Same thresholds used by inspect_metrics in incident_tools.py, reused here
-# so "recovered" means "back under the same bar that flagged the incident."
-RECOVERY_THRESHOLDS = {
-    "p95_latency_ms": 1000.0,
-    "http_5xx_rate_percent": 5.0,
-    "cpu_percent": 90.0,
-    "db_connection_pool_percent": 85.0,
-}
+RECOVERY_THRESHOLDS = {name: threshold for name, (threshold, _) in METRIC_THRESHOLDS.items()}
 
 
-def _choose_action(findings: list[EvidenceFinding]) -> str:
-    """
-    Pick a remediation action based on combined evidence from other agents.
-    Simple keyword-based heuristic, consistent with the rest of the codebase.
-    """
-    combined_text = " ".join(
-        f"{f.observation} {' '.join(f.evidence)}" for f in findings
-    ).lower()
-
-    if "deploy" in combined_text or "rollout" in combined_text:
-        return "rollback_deployment"
-    if "connection pool" in combined_text or "db" in combined_text:
-        return "scale_up_db_pool"
-    if "cpu" in combined_text:
-        return "restart_service"
-
-    return "clear_cache"
-
-
-def propose_remediation(findings: list[EvidenceFinding]) -> dict:
-    """
-    Propose a safe remediation action based on combined agent findings.
-
-    Returns:
-        dict with keys: action, risk_level, requires_approval, rationale
-    """
-    action = _choose_action(findings)
-    risk_level = ACTION_RISK_LEVELS.get(action, "high")
-    requires_approval = risk_level in RISK_LEVELS_REQUIRING_APPROVAL
-
-    rationale = (
-        f"Selected '{action}' based on combined evidence from "
-        f"{len(findings)} finding(s). Risk level: {risk_level}."
-    )
-
-    return {
-        "action": action,
-        "risk_level": risk_level,
-        "requires_approval": requires_approval,
-        "rationale": rationale,
-    }
+def recommend_remediation(incident: IncidentInput, findings: list[AgentFinding],
+                          unresolved: list[str] | None = None) -> RemediationReasoning:
+    request = RemediationInput(incident=incident, findings=findings,
+                               unresolved_questions=unresolved or [])
+    incident, findings, unresolved = request.incident, request.findings, request.unresolved_questions
+    usable = [f for f in findings if f.agent != "triage" and f.reasoning_status == "complete"]
+    if len(usable) < 2 or not any(f.evidence_refs for f in usable) or unresolved:
+        raise ValueError("Insufficient or conflicting evidence; remediation requires human review or more investigation")
+    refs = {r.ref for finding in usable for r in finding.evidence_refs}
+    result = invoke_structured(
+        "You recommend a simulated remediation. Use only supplied findings and evidence references. If evidence is weak or contradictory, choose investigate_more or escalate. Never claim approval, execution, or recovery. Compare benefits, prerequisites, risks, alternatives. Cite only supplied refs.",
+        f"Incident: {incident.model_dump(mode='json')}\nFindings: {compact_findings(usable)}\nUnresolved questions: {unresolved}",
+        RemediationReasoning)
+    if not set(result.evidence_refs).issubset(refs):
+        raise ValueError("Remediation reasoning cited unknown evidence references")
+    if result.recommend_action in {"investigate_more", "escalate"}:
+        raise ValueError(result.rationale)
+    return result
 
 
-def execute_remediation(proposal: dict, approved: bool = False) -> dict:
-    """
-    Attempt to execute a remediation proposal, enforcing the approval gate.
-
-    Args:
-        proposal: output of propose_remediation().
-        approved: whether a human has explicitly approved this action.
-
-    Returns:
-        dict with keys: executed (bool), reason (str)
-    """
-    if proposal["requires_approval"] and not approved:
-        return {
-            "executed": False,
-            "reason": f"Action '{proposal['action']}' requires human approval "
-                      f"(risk level: {proposal['risk_level']}) but was not approved.",
-        }
-
-    return {
-        "executed": True,
-        "reason": f"Action '{proposal['action']}' executed (simulated).",
-    }
+def propose_remediation(incident: IncidentInput, findings: list[AgentFinding],
+                        unresolved: list[str] | None = None) -> RemediationProposal:
+    reasoning = recommend_remediation(incident, findings, unresolved)
+    action = reasoning.recommend_action
+    risk = ACTION_RISK_LEVELS[action]
+    return RemediationProposal(action=action, risk_level=risk,
+        rationale=reasoning.rationale, expected_benefit=reasoning.expected_benefit,
+        prerequisites=reasoning.prerequisites, alternatives=reasoning.alternatives,
+        evidence_refs=reasoning.evidence_refs,
+        approval_status="awaiting_approval" if risk in RISK_LEVELS_REQUIRING_APPROVAL else "not_required")
 
 
-def verify_recovery(incident: IncidentInput, post_action_metrics: dict) -> dict:
-    """
-    Check simulated post-action metrics to determine if recovery occurred.
+def execute_remediation(proposal: RemediationProposal,
+                        approval: ApprovalRecord | None = None) -> dict:
+    """Simulate an action only after independently checking policy and approval identity."""
+    if not isinstance(proposal, RemediationProposal):
+        return {"executed": False, "reason": "Invalid proposal schema"}
+    expected_risk = ACTION_RISK_LEVELS.get(proposal.action)
+    if expected_risk is None or proposal.risk_level != expected_risk:
+        return {"executed": False, "reason": "Action or risk classification failed policy validation"}
+    if expected_risk in RISK_LEVELS_REQUIRING_APPROVAL:
+        if (not isinstance(approval, ApprovalRecord) or approval.decision != "approved"
+                or approval.proposal_id != proposal.proposal_id
+                or not approval.approved_by.strip()):
+            return {"executed": False, "reason": "Matching explicit approval is required"}
+    return {"executed": True, "simulated": True,
+            "reason": f"Action {proposal.action} simulated; this does not establish recovery."}
 
-    Compares post_action_metrics against the same thresholds used to flag
-    the original incident (see inspect_metrics in incident_tools.py).
 
-    Args:
-        incident: the original IncidentInput being resolved.
-        post_action_metrics: simulated metrics captured after remediation.
-
-    Returns:
-        dict with keys:
-            recovered (bool): True if no metric is still crossing its threshold.
-            still_elevated (list[str]): descriptions of metrics still crossing thresholds.
-            next_step (str): what to do next.
-    """
-    still_elevated = []
-
-    for metric, threshold in RECOVERY_THRESHOLDS.items():
-        value = post_action_metrics.get(metric)
-        if value is not None and value >= threshold:
-            still_elevated.append(
-                f"{metric} is still elevated: {value:g} (threshold {threshold:g})"
-            )
-
-    recovered = len(still_elevated) == 0
-
-    if recovered:
-        next_step = "Incident appears resolved. Close out and document the remediation."
-    else:
-        next_step = (
-            "Recovery incomplete. Escalate to a human operator or attempt an "
-            "alternative remediation action."
-        )
-
-    return {
-        "recovered": recovered,
-        "still_elevated": still_elevated,
-        "next_step": next_step,
-    }
+def verify_recovery(incident: IncidentInput, post_action_metrics: dict[str, float]) -> RecoveryResult:
+    del incident  # The verification contract is based only on explicitly post-action measurements.
+    missing = [name for name in RECOVERY_THRESHOLDS if name not in post_action_metrics]
+    elevated = [f"{name}={post_action_metrics[name]:g} (threshold {limit:g})"
+                for name, limit in RECOVERY_THRESHOLDS.items()
+                if name in post_action_metrics and post_action_metrics[name] >= limit]
+    if missing:
+        return RecoveryResult(outcome="insufficient_evidence", missing_metrics=missing,
+            still_elevated=elevated, checked_metrics=post_action_metrics,
+            explanation="Recovery cannot be established because required post-action metrics are missing.")
+    if elevated:
+        return RecoveryResult(outcome="not_recovered", still_elevated=elevated,
+            checked_metrics=post_action_metrics,
+            explanation="One or more required post-action metrics remain above threshold.")
+    return RecoveryResult(outcome="recovered", checked_metrics=post_action_metrics,
+        explanation="All required post-action metrics are below configured thresholds.")

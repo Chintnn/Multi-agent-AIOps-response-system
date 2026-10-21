@@ -1,101 +1,44 @@
-"""Log Investigation Agent – investigates error patterns, timeouts, and exceptions."""
-
-from app.incident_tools import inspect_logs
-from app.llm import ask_llm, llm_available
-from app.models import EvidenceFinding, IncidentInput
-
-
-def investigate_logs(incident: IncidentInput) -> EvidenceFinding:
-    """
-    Investigate logs for the given incident.
-
-    1. Run deterministic tool to extract evidence.
-    2. Optionally ask the LLM to refine observation, hypotheses and next step.
-    3. Fall back to rule-based logic when the LLM is unavailable.
-    """
-    finding = inspect_logs(incident)
-    evidence_text = "\n".join(finding.evidence) if finding.evidence else "(no matching log lines)"
-
-    # --- LLM path ---
-    if llm_available() and finding.evidence:
-        system = (
-            "You are the Log Investigation Agent in a multi-agent AIOps system. "
-            "Given log evidence from a software incident, produce a concise investigation result. "
-            "Reply in exactly this format (no extra text):\n"
-            "OBSERVATION: <1-3 sentences>\n"
-            "HYPOTHESES: <comma-separated short hypotheses>\n"
-            "NEXT_STEP: <one clear recommended next investigation step>"
-        )
-        user = (
-            f"Service: {incident.service}\n"
-            f"Summary: {incident.summary}\n"
-            f"Severity: {incident.severity}\n"
-            f"Log evidence:\n{evidence_text}"
-        )
-        llm_reply = ask_llm(system, user)
-        if llm_reply:
-            observation, next_step = _parse_llm_reply(llm_reply, finding)
-            return EvidenceFinding(
-                source="log_agent",
-                observation=observation,
-                evidence=finding.evidence,
-                suggested_next_step=next_step,
-            )
-
-    # --- Deterministic fallback (always available) ---
-    return _deterministic_log_finding(finding)
+"""Log evidence retrieval is deterministic; interpretation is LLM-driven."""
+from app.incident_tools import retrieve_logs
+from app.agents.context import compact_findings, compact_telemetry_records, compact_evidence_refs, compact_incident
+from app.evidence_tools import query_evidence, result_refs
+from app.llm import invoke_structured
+from app.models import (AgentFinding, EvidenceQueryState, IncidentInput, LogAnalysis,
+                        LogInvestigationInput, SpecialistReasoning)
+from app.telemetry import EvidenceSource, EvidenceWindow
 
 
-def _parse_llm_reply(reply: str, base: EvidenceFinding) -> tuple[str, str]:
-    observation = base.observation
-    next_step = base.suggested_next_step or "Correlate with metrics and recent changes."
-
-    for line in reply.splitlines():
-        line = line.strip()
-        if line.upper().startswith("OBSERVATION:"):
-            observation = line.split(":", 1)[1].strip()
-        elif line.upper().startswith("NEXT_STEP:"):
-            next_step = line.split(":", 1)[1].strip()
-        elif line.upper().startswith("HYPOTHESES:"):
-            hyps = line.split(":", 1)[1].strip()
-            if hyps:
-                observation = f"{observation} Possible causes: {hyps}."
-
-    return observation, next_step
-
-
-def _deterministic_log_finding(finding: EvidenceFinding) -> EvidenceFinding:
-    hypotheses: list[str] = []
-    evidence_text = " ".join(finding.evidence).lower()
-
-    if not finding.evidence:
-        observation = (
-            "No error-related log lines found in the supplied sample. "
-            "Evidence is currently insufficient to support a log-based root cause."
-        )
-        next_step = "Request a wider log time window or additional log sources."
-    else:
-        if "timeout" in evidence_text or "database connection" in evidence_text:
-            hypotheses.append("Database connection acquisition failures / pool pressure")
-        if "failed to create order" in evidence_text:
-            hypotheses.append("Order creation failing due to downstream DB issues")
-        if "exception" in evidence_text:
-            hypotheses.append("Unhandled exception path contributing to errors")
-
-        observation = finding.observation
-        if hypotheses:
-            observation += f" Possible causes: {'; '.join(hypotheses)}."
-        else:
-            observation += " Error signals present but no strong pattern matched yet."
-
-        next_step = (
-            finding.suggested_next_step
-            or "Correlate these log findings with metrics and recent deployment timeline."
-        )
-
-    return EvidenceFinding(
-        source="log_agent",
-        observation=observation,
-        evidence=finding.evidence,
-        suggested_next_step=next_step,
-    )
+def investigate_logs(incident: IncidentInput, question: str = "Investigate supplied logs",
+                     prior_findings: list[AgentFinding] | None = None, *,
+                     evidence_source: EvidenceSource | None = None,
+                     evidence_window: EvidenceWindow | None = None,
+                     execution_id: str = "offline") -> LogAnalysis:
+    request = LogInvestigationInput(incident=incident, question=question,
+                                    prior_findings=prior_findings or [])
+    incident = request.incident
+    records = retrieve_logs(incident, question)
+    query_result = query_evidence(evidence_source, "logs", incident, execution_id, evidence_window)
+    telemetry_refs = result_refs(query_result)
+    records.extend(telemetry_refs)
+    telemetry_context = ({"status": query_result.status, "reason": query_result.reason,
+        "missing_evidence": query_result.missing_evidence,
+        "observations": compact_telemetry_records(query_result.records)}
+        if query_result else None)
+    reasoning = invoke_structured(
+        "You investigate supplied log records. Distinguish observed facts from hypotheses. Cite only the provided refs; do not invent timestamps, queries, records, or external access. Consider whether coverage is sufficient and what evidence would change the conclusion.",
+        f"Question: {request.question[:300]}\nIncident: {compact_incident(incident)}\nPrior findings: {compact_findings(prior_findings or [])}\nRecords: {compact_evidence_refs(records)}\nTelemetry query: {telemetry_context}",
+        SpecialistReasoning)
+    allowed = {r.ref for r in records}
+    hypotheses = [h.model_copy(update={"supporting_refs": [x for x in h.supporting_refs if x in allowed],
+                                       "contradicting_refs": [x for x in h.contradicting_refs if x in allowed]})
+                  for h in reasoning.hypotheses]
+    return LogAnalysis(summary=reasoning.summary, observed_facts=[r.excerpt for r in records],
+        hypotheses=hypotheses, evidence_refs=records, uncertainty=reasoning.contradictions,
+        missing_evidence=reasoning.missing_evidence + (query_result.missing_evidence if query_result else []),
+        evidence_queries=([EvidenceQueryState(source=query_result.query.source,
+            status="retrieved" if query_result.status == "available" else query_result.status,
+            record_count=len(query_result.records),
+            missing_evidence=query_result.missing_evidence, reason=query_result.reason)]
+            if query_result else []),
+        follow_up=reasoning.follow_up,
+        timestamps=[r.observed_at.isoformat() for r in records if r.observed_at])
