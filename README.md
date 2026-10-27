@@ -1,4 +1,4 @@
-# Multi-Agent AIOps Incident Response System
+# Multi-Agent AIOps Incident Response System.
 
 This Python service investigates an incident using five coordinated roles: alert triage, log investigation, metrics investigation, change analysis, and remediation/recovery. Triage and specialist interpretation use structured Groq LLM responses; tools retrieve only evidence supplied in the incident and calculate numeric threshold results deterministically. The workflow may choose different investigations based on the incident and accumulated findings. Actions are simulated only.
 
